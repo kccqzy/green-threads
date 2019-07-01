@@ -1,4 +1,4 @@
-#include <algorithm>
+#include <assert.h>
 #include <deque>
 #include <stddef.h>
 #include <stdint.h>
@@ -52,14 +52,12 @@ struct Thread {
     void* stack;
     ThreadContext ctx;
     ThreadState state;
-    bool is_system_thread;
     // The system thread is special in that it does not use the stack from
     // malloc; it uses the system-provided stack. There is exactly one system
-    // thread.
+    // thread. It is distinguished by having a null pointer as its stack here.
     Thread() : Thread(false) {}
     explicit Thread(bool is_system_thread)
-      : stack(nullptr), state(ThreadState::Dead),
-        is_system_thread(is_system_thread) {
+      : stack(nullptr), state(ThreadState::Dead) {
         if (!is_system_thread) {
             stack = malloc(STACK_SIZE);
             if (!stack) {
@@ -71,9 +69,7 @@ struct Thread {
     ~Thread() { free(stack); }
     Thread(Thread const&) = delete;
     Thread& operator=(Thread const&) = delete;
-    Thread(Thread&& th)
-      : stack(th.stack), ctx(th.ctx), state(th.state),
-        is_system_thread(th.is_system_thread) {
+    Thread(Thread&& th) : stack(th.stack), ctx(th.ctx), state(th.state) {
         th.stack = nullptr;
         th.state = ThreadState::Dead;
     }
@@ -82,7 +78,6 @@ struct Thread {
         stack = th.stack;
         ctx = th.ctx;
         state = th.state;
-        is_system_thread = th.is_system_thread;
         th.stack = nullptr;
         return *this;
     }
@@ -100,8 +95,9 @@ private:
     // Return from a green thread. When a green thread finishes, this will be
     // called.
     void ret() {
-        assert(!current_thread.is_system_thread);
-        // The system thread is running the loop. It cannot return.
+        assert(current_thread.stack);
+        // The system thread (without its special stack) is running the loop. It
+        // cannot return.
         current_thread.state = ThreadState::Dead;
         do_yield();
     }
@@ -119,6 +115,10 @@ private:
         return rt;
     }
 
+    // Yield from the current thread. If there is a different thread ready to be
+    // run, switch to that thread; when the originally thread has been switched
+    // back, return true. If there is not a different thread to switch to,
+    // return false.
     bool do_yield() {
         assert(current_thread.state == ThreadState::Running ||
                current_thread.state == ThreadState::Dead);
