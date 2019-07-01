@@ -10,7 +10,7 @@
 #define DEFAULT_THREADS 4
 
 enum class ThreadState {
-    Available,
+    Dead,
     Ready,
     Running,
 };
@@ -58,7 +58,7 @@ struct Thread {
     // thread.
     Thread() : Thread(false) {}
     explicit Thread(bool is_system_thread)
-      : stack(nullptr), state(ThreadState::Available),
+      : stack(nullptr), state(ThreadState::Dead),
         is_system_thread(is_system_thread) {
         if (!is_system_thread) {
             stack = malloc(STACK_SIZE);
@@ -75,7 +75,7 @@ struct Thread {
       : stack(th.stack), ctx(th.ctx), state(th.state),
         is_system_thread(th.is_system_thread) {
         th.stack = nullptr;
-        th.state = ThreadState::Available;
+        th.state = ThreadState::Dead;
     }
     Thread& operator=(Thread&& th) {
         free(stack);
@@ -102,7 +102,7 @@ private:
     void ret() {
         assert(!current_thread.is_system_thread);
         // The system thread is running the loop. It cannot return.
-        current_thread.state = ThreadState::Available;
+        current_thread.state = ThreadState::Dead;
         do_yield();
     }
 
@@ -121,11 +121,11 @@ private:
 
     bool do_yield() {
         assert(current_thread.state == ThreadState::Running ||
-               current_thread.state == ThreadState::Available);
+               current_thread.state == ThreadState::Dead);
 
         // Find the first thread that is ready to run.
         while (!threads.empty()) {
-            if (threads.front().state == ThreadState::Available) {
+            if (threads.front().state == ThreadState::Dead) {
                 threads.pop_front();
             } else if (threads.front().state == ThreadState::Running) {
                 assert(false); // This should not happen. No thread in this
@@ -140,7 +140,7 @@ private:
             return false;
         } else {
             // Yield to a new and different thread at the front of the queue.
-            if (current_thread.state != ThreadState::Available) {
+            if (current_thread.state != ThreadState::Dead) {
                 current_thread.state = ThreadState::Ready;
             }
             threads.emplace_back(std::move(current_thread));
