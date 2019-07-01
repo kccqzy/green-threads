@@ -49,11 +49,10 @@ static_assert(offsetof(ThreadContext, rbx) == 0x28, "unexpected offset");
 static_assert(offsetof(ThreadContext, rbp) == 0x30, "unexpected offset");
 
 struct Thread {
-    size_t id;
     void* stack;
     ThreadContext ctx;
     ThreadState state;
-    Thread() : id(0), stack(), state(ThreadState::Available) {
+    Thread() : stack(), state(ThreadState::Available) {
         stack = malloc(STACK_SIZE);
         if (!stack) {
             fputs("Could not allocate memory for new thread.\n", stderr);
@@ -64,12 +63,11 @@ struct Thread {
     Thread(Thread const&) = delete;
     Thread& operator=(Thread const&) = delete;
     Thread(Thread&& th)
-      : id(th.id), stack(th.stack), ctx(th.ctx), state(th.state) {
+      : stack(th.stack), ctx(th.ctx), state(th.state) {
         th.stack = nullptr;
     }
     Thread& operator=(Thread&& th) {
         free(stack);
-        id = th.id;
         stack = th.stack;
         ctx = th.ctx;
         state = th.state;
@@ -91,7 +89,6 @@ private:
     static void finish() { Runtime::instance().ret(); }
     Runtime() : current(0), threads() {
         threads.front().state = ThreadState::Running;
-        for (size_t i = 1; i <= DEFAULT_THREADS; ++i) { threads[i].id = i; }
     }
     Runtime(Runtime const&) = delete;
     Runtime& operator=(Runtime const&) = delete;
