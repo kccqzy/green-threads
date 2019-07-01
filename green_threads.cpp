@@ -1,5 +1,5 @@
 #include <algorithm>
-#include <array>
+#include <deque>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -52,7 +52,8 @@ struct Thread {
     void* stack;
     ThreadContext ctx;
     ThreadState state;
-    Thread() : stack(), state(ThreadState::Available) {
+    bool is_system_thread;
+    Thread() : stack(), state(ThreadState::Available), is_system_thread(false) {
         stack = malloc(STACK_SIZE);
         if (!stack) {
             fputs("Could not allocate memory for new thread.\n", stderr);
@@ -62,8 +63,7 @@ struct Thread {
     ~Thread() { free(stack); }
     Thread(Thread const&) = delete;
     Thread& operator=(Thread const&) = delete;
-    Thread(Thread&& th)
-      : stack(th.stack), ctx(th.ctx), state(th.state) {
+    Thread(Thread&& th) : stack(th.stack), ctx(th.ctx), state(th.state) {
         th.stack = nullptr;
     }
     Thread& operator=(Thread&& th) {
@@ -78,17 +78,24 @@ struct Thread {
 
 class Runtime {
 private:
-    size_t current;
-    std::array<Thread, 1 + DEFAULT_THREADS> threads;
+    // A round-robin queue of threads to be scheduled. There is a system thread
+    // used for running the scheduler itself. INVARIANT: The current thread is
+    // always the last one in the queue.
+    std::deque<Thread> threads;
+    Thread* current_thread;
     void ret() {
-        if (current) {
-            threads[current].state = ThreadState::Available;
-            do_yield();
-        }
+        assert(!current_thread->is_system_thread);
+        // The system thread is running the loop. It cannot return.
+        current_thread->state = ThreadState::Available;
+        do_yield();
     }
     static void finish() { Runtime::instance().ret(); }
-    Runtime() : current(0), threads() {
+    Runtime() : threads() {
+        // Create initial system thread
+        threads.resize(1);
         threads.front().state = ThreadState::Running;
+        threads.front().is_system_thread = true;
+        current_thread = &threads.front();
     }
     Runtime(Runtime const&) = delete;
     Runtime& operator=(Runtime const&) = delete;
@@ -98,41 +105,52 @@ private:
         return rt;
     }
     bool do_yield() {
-        auto next_ready = std::find_if(
-          threads.begin() + current, threads.end(),
-          [](Thread const& th) { return th.state == ThreadState::Ready; });
-        if (next_ready == threads.end()) {
-            next_ready = std::find_if(
-              threads.begin(), threads.begin() + current,
-              [](Thread const& th) { return th.state == ThreadState::Ready; });
+        // If the current thread is not dead, set it to be ready.
+        if (current_thread->state != ThreadState::Available)
+            current_thread->state = ThreadState::Ready;
+
+        auto old_current_thread = std::move(threads.back());
+        threads.pop_back();
+
+        // Find the first thread that is ready to run.
+        while (!threads.empty()) {
+            if (threads.front().state == ThreadState::Available) {
+                threads.pop_front();
+            } else if (threads.front().state == ThreadState::Running) {
+                assert(false); // This should not happen. No thread is running.
+            } else if (threads.front().state == ThreadState::Ready) {
+                break;
+            }
         }
-        if (next_ready == threads.begin() + current) { return false; }
 
-        if (threads[current].state != ThreadState::Available)
-            threads[current].state = ThreadState::Ready;
-
-        next_ready->state = ThreadState::Running;
-        size_t old = current;
-        current = next_ready - threads.begin();
-
-        ThreadContext::switch_to(threads[old].ctx, next_ready->ctx);
-        return true;
+        if (threads.empty()) {
+            // No other thread to yield to. Resume running the current thread.
+            threads.emplace_back(std::move(old_current_thread));
+            threads.back().state = ThreadState::Running;
+            return false;
+        } else {
+            // Yield to a new and different thread.
+            threads.emplace_back(std::move(old_current_thread));
+            ThreadContext& old_ctx = threads.back().ctx;
+            auto next_thread = std::move(threads.front());
+            threads.pop_front();
+            next_thread.state = ThreadState::Running;
+            threads.emplace_back(std::move(next_thread));
+            current_thread = &threads.back();
+            ThreadContext& new_ctx = threads.back().ctx;
+            ThreadContext::switch_to(old_ctx, new_ctx);
+            return true;
+        }
     }
     void do_spawn(void (*func)()) {
-        auto avail =
-          std::find_if(threads.begin(), threads.end(), [](Thread const& th) {
-              return th.state == ThreadState::Available;
-          });
-        if (avail == threads.end()) {
-            fputs("Cannot spawn task. No available threads.\n", stderr);
-            exit(2);
-        }
+        Thread new_thread;
         void (*guard)() = Runtime::finish;
-        memcpy((unsigned char*) avail->stack + STACK_SIZE - 8, &guard, 8);
-        memcpy((unsigned char*) avail->stack + STACK_SIZE - 16, &func, 8);
-        avail->ctx.rsp =
-          (uint64_t)((unsigned char*) avail->stack + STACK_SIZE - 16);
-        avail->state = ThreadState::Ready;
+        memcpy((unsigned char*) new_thread.stack + STACK_SIZE - 8, &guard, 8);
+        memcpy((unsigned char*) new_thread.stack + STACK_SIZE - 16, &func, 8);
+        new_thread.ctx.rsp =
+          (uint64_t)((unsigned char*) new_thread.stack + STACK_SIZE - 16);
+        new_thread.state = ThreadState::Ready;
+        threads.emplace_front(std::move(new_thread));
     }
     [[noreturn]] void do_run() {
         while (do_yield())
@@ -160,7 +178,7 @@ static void thread2() {
         printf("thread 2 counting %d\n", i);
         Runtime::yield();
     }
-    puts("thread 2 finished counting; calling thread1");
+    puts("thread 2 finished counting; calling thread1 again");
     Runtime::spawn(thread1);
 }
 
