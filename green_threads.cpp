@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define STACK_SIZE (8192)
+#define STACK_SIZE (1048576)
 #define DEFAULT_THREADS 4
 
 enum class ThreadState {
@@ -53,24 +53,36 @@ struct Thread {
     ThreadContext ctx;
     ThreadState state;
     bool is_system_thread;
-    Thread() : stack(), state(ThreadState::Available), is_system_thread(false) {
-        stack = malloc(STACK_SIZE);
-        if (!stack) {
-            fputs("Could not allocate memory for new thread.\n", stderr);
-            exit(1);
+    // The system thread is special in that it does not use the stack from
+    // malloc; it uses the system-provided stack. There is exactly one system
+    // thread.
+    Thread() : Thread(false) {}
+    explicit Thread(bool is_system_thread)
+      : stack(nullptr), state(ThreadState::Available),
+        is_system_thread(is_system_thread) {
+        if (!is_system_thread) {
+            stack = malloc(STACK_SIZE);
+            if (!stack) {
+                fputs("Could not allocate memory for new thread.\n", stderr);
+                exit(1);
+            }
         }
     }
     ~Thread() { free(stack); }
     Thread(Thread const&) = delete;
     Thread& operator=(Thread const&) = delete;
-    Thread(Thread&& th) : stack(th.stack), ctx(th.ctx), state(th.state) {
+    Thread(Thread&& th)
+      : stack(th.stack), ctx(th.ctx), state(th.state),
+        is_system_thread(th.is_system_thread) {
         th.stack = nullptr;
+        th.state = ThreadState::Available;
     }
     Thread& operator=(Thread&& th) {
         free(stack);
         stack = th.stack;
         ctx = th.ctx;
         state = th.state;
+        is_system_thread = th.is_system_thread;
         th.stack = nullptr;
         return *this;
     }
@@ -79,24 +91,26 @@ struct Thread {
 class Runtime {
 private:
     // A round-robin queue of threads to be scheduled. There is a system thread
-    // used for running the scheduler itself. INVARIANT: The current thread is
-    // always the last one in the queue.
+    // that basically only ever yields and exits at the end.
     std::deque<Thread> threads;
-    Thread* current_thread;
+
+    // The currently running thread.
+    Thread current_thread;
+
+    // Return from a green thread. When a green thread finishes, this will be
+    // called.
     void ret() {
-        assert(!current_thread->is_system_thread);
+        assert(!current_thread.is_system_thread);
         // The system thread is running the loop. It cannot return.
-        current_thread->state = ThreadState::Available;
+        current_thread.state = ThreadState::Available;
         do_yield();
     }
-    static void finish() { Runtime::instance().ret(); }
-    Runtime() : threads() {
+
+    Runtime() : threads(), current_thread(true) {
         // Create initial system thread
-        threads.resize(1);
-        threads.front().state = ThreadState::Running;
-        threads.front().is_system_thread = true;
-        current_thread = &threads.front();
+        current_thread.state = ThreadState::Running;
     }
+
     Runtime(Runtime const&) = delete;
     Runtime& operator=(Runtime const&) = delete;
 
@@ -104,20 +118,18 @@ private:
         static Runtime rt;
         return rt;
     }
-    bool do_yield() {
-        // If the current thread is not dead, set it to be ready.
-        if (current_thread->state != ThreadState::Available)
-            current_thread->state = ThreadState::Ready;
 
-        auto old_current_thread = std::move(threads.back());
-        threads.pop_back();
+    bool do_yield() {
+        assert(current_thread.state == ThreadState::Running ||
+               current_thread.state == ThreadState::Available);
 
         // Find the first thread that is ready to run.
         while (!threads.empty()) {
             if (threads.front().state == ThreadState::Available) {
                 threads.pop_front();
             } else if (threads.front().state == ThreadState::Running) {
-                assert(false); // This should not happen. No thread is running.
+                assert(false); // This should not happen. No thread in this
+                               // queue is running.
             } else if (threads.front().state == ThreadState::Ready) {
                 break;
             }
@@ -125,32 +137,38 @@ private:
 
         if (threads.empty()) {
             // No other thread to yield to. Resume running the current thread.
-            threads.emplace_back(std::move(old_current_thread));
-            threads.back().state = ThreadState::Running;
             return false;
         } else {
-            // Yield to a new and different thread.
-            threads.emplace_back(std::move(old_current_thread));
+            // Yield to a new and different thread at the front of the queue.
+            if (current_thread.state != ThreadState::Available) {
+                current_thread.state = ThreadState::Ready;
+            }
+            threads.emplace_back(std::move(current_thread));
             ThreadContext& old_ctx = threads.back().ctx;
-            auto next_thread = std::move(threads.front());
+            current_thread = std::move(threads.front());
             threads.pop_front();
-            next_thread.state = ThreadState::Running;
-            threads.emplace_back(std::move(next_thread));
-            current_thread = &threads.back();
-            ThreadContext& new_ctx = threads.back().ctx;
+            current_thread.state = ThreadState::Running;
+            ThreadContext& new_ctx = current_thread.ctx;
             ThreadContext::switch_to(old_ctx, new_ctx);
             return true;
         }
     }
     void do_spawn(void (*func)()) {
         Thread new_thread;
-        void (*guard)() = Runtime::finish;
+
+        // Place the address of exit_thread on top of the stack, so that if the
+        // green thread function returns, it returns into that function.
+        void (*guard)() = Runtime::exit_thread;
         memcpy((unsigned char*) new_thread.stack + STACK_SIZE - 8, &guard, 8);
         memcpy((unsigned char*) new_thread.stack + STACK_SIZE - 16, &func, 8);
+
+        // The rsp of a new thread points to the address of the function we want
+        // to run, because the first real instruction after switching stack and
+        // state is "ret".
         new_thread.ctx.rsp =
           (uint64_t)((unsigned char*) new_thread.stack + STACK_SIZE - 16);
         new_thread.state = ThreadState::Ready;
-        threads.emplace_front(std::move(new_thread));
+        threads.emplace_back(std::move(new_thread));
     }
     [[noreturn]] void do_run() {
         while (do_yield())
@@ -162,6 +180,7 @@ public:
     static bool yield() { return instance().do_yield(); }
     static void spawn(void (*func)()) { return instance().do_spawn(func); }
     static void run_forever() { return instance().do_run(); }
+    static void exit_thread() { return instance().ret(); }
 };
 
 static void thread1() {
