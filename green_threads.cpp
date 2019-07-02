@@ -1,5 +1,7 @@
 #include <assert.h>
 #include <deque>
+#include <functional>
+#include <memory>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -53,52 +55,62 @@ static_assert(offsetof(ThreadContext, r12) == 0x20, "unexpected offset");
 static_assert(offsetof(ThreadContext, rbx) == 0x28, "unexpected offset");
 static_assert(offsetof(ThreadContext, rbp) == 0x30, "unexpected offset");
 
-struct Thread {
+struct ThreadStack {
     void* stack;
+    operator void*() const { return stack; }
+    operator unsigned char*() const { return (unsigned char*) stack; }
+    operator char*() const { return (char*) stack; }
+    operator bool() const { return stack; }
+    ThreadStack() : stack() {
+        size_t guard_size = STACK_ALLOC_SIZE - STACK_SIZE;
+        stack =
+          mmap(0, STACK_ALLOC_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (stack == MAP_FAILED) {
+            fputs(
+              "Could not allocate virtual address space for new thread "
+              "stack.\n",
+              stderr);
+            exit(1);
+        }
+        if (mprotect((unsigned char*) stack + guard_size,
+                     STACK_ALLOC_SIZE - guard_size,
+                     PROT_READ | PROT_WRITE) == -1) {
+            fputs("Could not set protection on stack.\n", stderr);
+            exit(1);
+        }
+    }
+    explicit ThreadStack(void* stack) : stack(stack) {}
+    ~ThreadStack() {
+        if (stack) munmap(stack, 2 * STACK_MAX_SIZE);
+    }
+    ThreadStack(ThreadStack const&) = delete;
+    ThreadStack& operator=(ThreadStack const&) = delete;
+    ThreadStack(ThreadStack&& ts) : stack(ts.stack) { ts.stack = nullptr; }
+    ThreadStack& operator=(ThreadStack&& th) {
+        if (stack) munmap(stack, 2 * STACK_MAX_SIZE);
+        stack = th.stack;
+        th.stack = nullptr;
+        return *this;
+    }
+};
+
+struct Thread {
+    ThreadStack stack;
     ThreadContext ctx;
     ThreadState state;
+    std::unique_ptr<std::function<void()>> callable;
     // The system thread is special in that it does not use the stack from
     // malloc; it uses the system-provided stack. There is exactly one system
     // thread. It is distinguished by having a null pointer as its stack here.
     Thread() : Thread(false) {}
     explicit Thread(bool is_system_thread)
       : stack(nullptr), state(ThreadState::Dead) {
-        if (!is_system_thread) {
-            size_t guard_size = STACK_ALLOC_SIZE - STACK_SIZE;
-            stack = mmap(0, STACK_ALLOC_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANON,
-                         -1, 0);
-            if (stack == MAP_FAILED) {
-                fputs(
-                  "Could not allocate virtual address space for new thread "
-                  "stack.\n",
-                  stderr);
-                exit(1);
-            }
-            if (mprotect((unsigned char*) stack + guard_size,
-                         STACK_ALLOC_SIZE - guard_size,
-                         PROT_READ | PROT_WRITE) == -1) {
-                fputs("Could not set protection on stack.\n", stderr);
-                exit(1);
-            }
-        }
-    }
-    ~Thread() {
-        if (stack) munmap(stack, 2 * STACK_MAX_SIZE);
+        if (!is_system_thread) { stack = ThreadStack(); }
     }
     Thread(Thread const&) = delete;
     Thread& operator=(Thread const&) = delete;
-    Thread(Thread&& th) : stack(th.stack), ctx(th.ctx), state(th.state) {
-        th.stack = nullptr;
-        th.state = ThreadState::Dead;
-    }
-    Thread& operator=(Thread&& th) {
-        if (stack) munmap(stack, 2 * STACK_MAX_SIZE);
-        stack = th.stack;
-        ctx = th.ctx;
-        state = th.state;
-        th.stack = nullptr;
-        return *this;
-    }
+    Thread(Thread&& th) = default;
+    Thread& operator=(Thread&&) = default;
 };
 
 class Runtime {
@@ -172,6 +184,7 @@ private:
             return true;
         }
     }
+
     void do_spawn(void (*func)()) {
         Thread new_thread;
 
@@ -191,6 +204,19 @@ private:
         new_thread.state = ThreadState::Ready;
         threads.emplace_back(std::move(new_thread));
     }
+
+    void do_spawn_callable(std::function<void()>&& func) {
+        assert(func);
+        do_spawn([]() {
+            assert(instance().current_thread.callable);
+            (*instance().current_thread.callable)();
+        });
+        threads.back().callable = std::make_unique<std::function<void()>>(
+          std::forward<std::function<void()>>(func));
+        assert(threads.back().callable);
+        assert(*threads.back().callable);
+    }
+
     [[noreturn]] void do_run() {
         setup_growable_stack();
         while (do_yield())
@@ -233,13 +259,6 @@ private:
         }
     }
 
-    static void do_grow_stack(int sig, siginfo_t* info, void* ucontext) {
-        (void) sig;
-        (void) ucontext;
-        void* fault_addr = info->si_addr;
-        instance().grow_stack(fault_addr);
-    }
-
     void setup_growable_stack() {
         static char sigstack[81920];
         stack_t st = {};
@@ -252,7 +271,12 @@ private:
 
         struct sigaction sa = {};
         sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
-        sa.sa_sigaction = do_grow_stack;
+        sa.sa_sigaction = [](int sig, siginfo_t* info, void* ucontext) {
+            (void) sig;
+            (void) ucontext;
+            void* fault_addr = info->si_addr;
+            instance().grow_stack(fault_addr);
+        };
 
         if (sigaction(SIGSEGV, &sa, NULL) == -1 ||
             sigaction(SIGBUS, &sa, NULL) == -1) {
@@ -264,6 +288,10 @@ private:
 public:
     static bool yield() { return instance().do_yield(); }
     static void spawn(void (*func)()) { return instance().do_spawn(func); }
+    static void spawn_callable(std::function<void()>&& func) {
+        return instance().do_spawn_callable(
+          std::forward<std::function<void()>>(func));
+    }
     static void run_forever() { return instance().do_run(); }
     static void exit_thread() { return instance().ret(); }
     static ptrdiff_t get_current_stack_usage() {
@@ -303,13 +331,19 @@ static uint64_t lots_of_stack(uint64_t m, uint64_t n) {
     return rv;
 }
 
-static void do_use_lots_of_stack() {
-    printf("final result = %llu\n", lots_of_stack(4, 4));
-}
-
 int main() {
+    volatile uint64_t ack35 = 0;
     Runtime::spawn(func1);
     Runtime::spawn(func2);
-    Runtime::spawn(do_use_lots_of_stack);
+    Runtime::spawn(
+      []() { printf("final result = %llu\n", lots_of_stack(3, 6)); });
+    Runtime::spawn_callable([&ack35]() { ack35 = lots_of_stack(3, 5); });
+    Runtime::spawn_callable([&ack35]() {
+        while (!ack35) {
+            puts("other thread hasn't finished calculating ack(3,5) yet");
+            Runtime::yield();
+        }
+        printf("Finished ack(3,5) = %llu\n", ack35);
+    });
     Runtime::run_forever();
 }
