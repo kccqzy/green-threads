@@ -11,6 +11,18 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+// Naked functions are only supported since GCC 8. clang seems to support it
+// since eons ago.
+#ifdef __GNUC__
+#ifndef __clang__
+#if __GNUC__ < 8
+#error "Please upgrade to GCC 8 or newer."
+#endif
+#endif
+#else
+#warning "Unsupported compiler. YMMV"
+#endif
+
 #define STACK_SIZE (8192)
 #define STACK_MAX_SIZE (1024 * STACK_SIZE)
 #define STACK_ALLOC_SIZE (2 * STACK_MAX_SIZE)
