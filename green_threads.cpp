@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <deque>
 #include <functional>
+#include <inttypes.h>
 #include <memory>
 #include <signal.h>
 #include <stddef.h>
@@ -338,8 +339,8 @@ static uint64_t lots_of_stack(uint64_t m, uint64_t n) {
     else if (n == 0)
         return lots_of_stack(m - 1, 1);
     Runtime::yield();
-    auto rv = lots_of_stack(m - 1, lots_of_stack(m, n - 1));
-    printf("ackermann(%llu, %llu) = %llu\n", m, n, rv);
+    uint64_t rv = lots_of_stack(m - 1, lots_of_stack(m, n - 1));
+    printf("ackermann(%" PRIu64 ", %" PRIu64 ") = %" PRIu64 "\n", m, n, rv);
     return rv;
 }
 
@@ -348,14 +349,14 @@ int main() {
     Runtime::spawn(func1);
     Runtime::spawn(func2);
     Runtime::spawn(
-      []() { printf("final result = %llu\n", lots_of_stack(3, 6)); });
+      []() { printf("final result = %" PRIu64 "\n", lots_of_stack(3, 6)); });
     Runtime::spawn_callable([&ack35]() { ack35 = lots_of_stack(3, 5); });
     Runtime::spawn_callable([&ack35]() {
         while (!ack35) {
             puts("other thread hasn't finished calculating ack(3,5) yet");
             Runtime::yield();
         }
-        printf("Finished ack(3,5) = %llu\n", ack35);
+        printf("Finished ack(3,5) = %" PRIu64 "\n", ack35);
     });
     Runtime::run_forever();
 }
