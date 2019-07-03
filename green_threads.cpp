@@ -203,17 +203,22 @@ private:
 
         // Place the address of exit_thread on top of the stack, so that if the
         // green thread function returns, it returns into that function.
-        void (*guard)() = Runtime::exit_thread;
-        memcpy((unsigned char*) new_thread.stack + STACK_ALLOC_SIZE - 8, &guard,
-               8);
-        memcpy((unsigned char*) new_thread.stack + STACK_ALLOC_SIZE - 16, &func,
-               8);
+        // However, we need the make sure the stack is properly aligned for this
+        // function, i.e. upon function entry rsp+8 is on a 16-byte boundary.
+        // So the addresses of these two functions must be 16-byte aligned. We
+        // put a dummy function in between.
+        void (*exiter)() = &Runtime::exit_thread;
+        void (*before_exit)() = [] {};
+        unsigned char* stack_top =
+          (unsigned char*) new_thread.stack + STACK_ALLOC_SIZE;
+        memcpy(stack_top - 16, &exiter, 8);
+        memcpy(stack_top - 24, &before_exit, 8);
+        memcpy(stack_top - 32, &func, 8);
 
         // The rsp of a new thread points to the address of the function we want
         // to run, because the first real instruction after switching stack and
         // state is "ret".
-        new_thread.ctx.rsp =
-          (uint64_t)((unsigned char*) new_thread.stack + STACK_ALLOC_SIZE - 16);
+        new_thread.ctx.rsp = (uint64_t)(stack_top - 32);
         new_thread.state = ThreadState::Ready;
         threads.emplace_back(std::move(new_thread));
     }
